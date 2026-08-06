@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptive-inference-gateway"
+version = "0.1.0"
+description = "Production-style image inference runtime with dynamic batching and backpressure"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = { file = "LICENSE" }
+authors = [{ name = "Sahil Arifi" }]
+dependencies = [
+  "fastapi",
+  "httpx",
+  "matplotlib",
+  "numpy",
+  "onnx",
+  "onnxruntime",
+  "onnxscript",
+  "pandas",
+  "pillow",
+  "prometheus-client",
+  "pydantic",
+  "pydantic-settings",
+  "python-multipart",
+  "pyyaml",
+  "rich",
+  "torch",
+  "torchvision",
+  "typer",
+  "uvicorn[standard]",
+]
+
+[project.scripts]
+inference-gateway = "inference_gateway.cli:app"
+
+[dependency-groups]
+dev = [
+  "mypy",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "ruff",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inference_gateway"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --cov=inference_gateway --cov-report=term-missing --cov-fail-under=85"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["inference_gateway"]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["matplotlib.*", "onnxruntime.*", "pandas.*", "torchvision.*", "yaml.*"]
+ignore_missing_imports = true
