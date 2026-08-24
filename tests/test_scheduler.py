@@ -112,6 +112,8 @@ class OutcomeBackend(MappingBackend):
         outcome = self._outcomes.popleft()
         if outcome == "error":
             raise RuntimeError("backend exploded")
+        if outcome == "timeout":
+            raise TimeoutError("backend internal timeout")
         logits = self._logits(batch)
         if outcome == "wrong_rows":
             return logits[:-1]
@@ -233,6 +235,37 @@ async def test_direct_scheduler_runs_one_backend_call_per_request_and_maps_rows(
 
 
 @pytest.mark.asyncio
+async def test_direct_queue_wait_includes_single_worker_executor_backlog() -> None:
+    backend = GateBackend()
+    scheduler = DirectScheduler(
+        backend,
+        make_config(
+            SchedulerMode.DIRECT,
+            max_queue_size=2,
+            inference_workers=1,
+        ),
+    )
+    await scheduler.start()
+    first = asyncio.create_task(
+        scheduler.submit("first", np.ones((2, 2), dtype=np.float32))
+    )
+    await wait_for_thread_event(backend.entered)
+    second = asyncio.create_task(
+        scheduler.submit("second", np.full((2, 2), 2.0, dtype=np.float32))
+    )
+
+    await asyncio.sleep(0.06)
+    backend.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert second_result.queue_wait_ms >= 40.0
+    assert second_result.queue_wait_ms > first_result.queue_wait_ms + 30.0
+    assert second_result.backend_inference_ms < second_result.queue_wait_ms
+    assert scheduler.stats.snapshot()["mean_queue_wait_ms"] >= 20.0
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_direct_capacity_rejects_and_close_settles_inflight_request() -> None:
     backend = GateBackend()
     scheduler = DirectScheduler(
@@ -255,6 +288,96 @@ async def test_direct_capacity_rejects_and_close_settles_inflight_request() -> N
     backend.release.set()
     await close_task
     assert scheduler.stats.snapshot()["current_queue_depth"] == 0
+
+
+async def wait_for_direct_capacity(scheduler: DirectScheduler, expected: int) -> None:
+    for _ in range(100):
+        if len(scheduler._admitted_tasks) == expected:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        "direct admission count never reached "
+        f"{expected}; got {len(scheduler._admitted_tasks)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_timeout_holds_capacity_until_backend_execution_finishes() -> None:
+    backend = GateBackend()
+    scheduler = DirectScheduler(
+        backend,
+        make_config(SchedulerMode.DIRECT, max_queue_size=1),
+    )
+    await scheduler.start()
+    timed_out = asyncio.create_task(
+        scheduler.submit(
+            "timed-out",
+            np.ones((2, 2), dtype=np.float32),
+            timeout_ms=20.0,
+        )
+    )
+    await wait_for_thread_event(backend.entered)
+    with pytest.raises(DeadlineExceededError, match="timed-out"):
+        await timed_out
+
+    assert not backend.exited.is_set()
+    for index in range(3):
+        with pytest.raises(QueueFullError, match="capacity is full"):
+            await scheduler.submit(
+                f"still-full-{index}",
+                np.full((2, 2), index + 2, dtype=np.float32),
+                timeout_ms=20.0,
+            )
+    assert scheduler.stats.rejected_requests == 3
+    assert len(scheduler._admitted_tasks) == 1
+
+    backend.release.set()
+    await wait_for_thread_event(backend.exited)
+    await wait_for_direct_capacity(scheduler, 0)
+    recovered = await scheduler.submit(
+        "recovered",
+        np.full((2, 2), 9.0, dtype=np.float32),
+    )
+    assert recovered.request_id == "recovered"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_cancellation_holds_capacity_until_backend_execution_finishes() -> None:
+    backend = GateBackend()
+    scheduler = DirectScheduler(
+        backend,
+        make_config(SchedulerMode.DIRECT, max_queue_size=1),
+    )
+    await scheduler.start()
+    cancelled = asyncio.create_task(
+        scheduler.submit("cancelled", np.ones((2, 2), dtype=np.float32))
+    )
+    await wait_for_thread_event(backend.entered)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    assert scheduler.stats.cancelled_requests == 1
+    assert not backend.exited.is_set()
+    for index in range(3):
+        with pytest.raises(QueueFullError, match="capacity is full"):
+            await scheduler.submit(
+                f"still-full-{index}",
+                np.full((2, 2), index + 2, dtype=np.float32),
+            )
+    assert scheduler.stats.rejected_requests == 3
+    assert len(scheduler._admitted_tasks) == 1
+
+    backend.release.set()
+    await wait_for_thread_event(backend.exited)
+    await wait_for_direct_capacity(scheduler, 0)
+    recovered = await scheduler.submit(
+        "recovered",
+        np.full((2, 2), 9.0, dtype=np.float32),
+    )
+    assert recovered.request_id == "recovered"
+    await scheduler.close()
 
 
 @pytest.mark.asyncio
@@ -496,6 +619,7 @@ async def test_cancelled_queued_request_does_not_corrupt_later_batches() -> None
     ("outcome", "error_type", "message"),
     [
         ("error", RuntimeError, "backend exploded"),
+        ("timeout", TimeoutError, "backend internal timeout"),
         ("wrong_rows", ValueError, "output row count"),
     ],
 )
@@ -526,6 +650,8 @@ async def test_backend_failure_is_propagated_and_worker_recovers(
     assert backend.call_count == 2
     snapshot = scheduler.stats.snapshot()
     assert snapshot["failed_requests"] == 1
+    assert snapshot["timed_out_requests"] == 0
+    assert snapshot["cancelled_requests"] == 0
     assert snapshot["completed_requests"] == 1
     assert snapshot["backend_inference_calls"] == 2
     await scheduler.close()
@@ -568,6 +694,35 @@ async def test_shutdown_settles_inflight_and_queued_futures() -> None:
         await scheduler.submit("after-close", np.ones((2, 2), dtype=np.float32))
     with pytest.raises(SchedulerClosedError, match="closed"):
         await scheduler.start()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_collection_settles_owned_request_and_queue_join() -> None:
+    backend = GateBackend()
+    scheduler = DynamicBatchScheduler(
+        backend,
+        make_config(max_batch_size=8, max_wait_ms=1000.0),
+    )
+    await scheduler.start()
+    pending = asyncio.create_task(
+        scheduler.submit("collecting", np.ones((2, 2), dtype=np.float32))
+    )
+    for _ in range(100):
+        if len(scheduler._active_batch) == 1:
+            break
+        await asyncio.sleep(0)
+    assert len(scheduler._active_batch) == 1
+    assert not backend.entered.is_set()
+
+    await asyncio.wait_for(scheduler.close(), timeout=0.2)
+    with pytest.raises(SchedulerClosedError, match="closed before request completion"):
+        await asyncio.wait_for(pending, timeout=0.2)
+    await asyncio.wait_for(scheduler._queue.join(), timeout=0.2)
+
+    assert scheduler._active_batch == []
+    assert scheduler.queue_depth == 0
+    assert scheduler.stats.current_queue_depth == 0
+    assert not backend.entered.is_set()
 
 
 @pytest.mark.asyncio

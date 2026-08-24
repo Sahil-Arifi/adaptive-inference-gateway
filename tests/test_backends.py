@@ -4,8 +4,11 @@ from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
+import onnx
+import onnxruntime as ort
 import pytest
 import torch
+from onnx import TensorProto, helper
 from torch import nn
 
 from inference_gateway.backends import FakeBackend, InferenceBackend, OnnxBackend, TorchBackend
@@ -39,6 +42,46 @@ def local_model_and_onnx(
     path = tmp_path_factory.mktemp("backend") / "tiny.onnx"
     export_model_to_onnx(model, path, torch.zeros(1, 3, 5, 5))
     return model, path
+
+
+def _write_identity_onnx(
+    path: Path,
+    *,
+    element_type: int = TensorProto.FLOAT,
+    output_element_type: int | None = None,
+    output_count: int = 1,
+    input_batch_dimension: str | int | None = "batch",
+    output_batch_dimension: str | int | None = "batch",
+) -> Path:
+    resolved_output_type = output_element_type or element_type
+    input_info = helper.make_tensor_value_info(
+        "images",
+        element_type,
+        [input_batch_dimension, 3, 5, 5],
+    )
+    outputs = [
+        helper.make_tensor_value_info(
+            f"output_{index}",
+            resolved_output_type,
+            [output_batch_dimension, 3, 5, 5],
+        )
+        for index in range(output_count)
+    ]
+    operation = "Identity" if resolved_output_type == element_type else "Cast"
+    nodes = []
+    for output in outputs:
+        attributes = {} if operation == "Identity" else {"to": resolved_output_type}
+        nodes.append(helper.make_node(operation, ["images"], [output.name], **attributes))
+    graph = helper.make_graph(nodes, "identity-contract", [input_info], outputs)
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18)],
+        producer_name="offline-test",
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+    return path
 
 
 def test_fake_backend_satisfies_protocol_and_is_deterministic() -> None:
@@ -171,7 +214,12 @@ def test_onnx_backend_matches_torch_and_closes_cleanly(
     local_model_and_onnx: tuple[TinyClassifier, Path],
 ) -> None:
     model, path = local_model_and_onnx
-    backend = OnnxBackend(path, device="cpu")
+    backend = OnnxBackend(
+        path,
+        device="cpu",
+        input_shape=(3, 5, 5),
+        expected_output_size=6,
+    )
     rng = np.random.default_rng(41)
     batch = rng.standard_normal((4, 3, 5, 5), dtype=np.float32)
 
@@ -185,6 +233,7 @@ def test_onnx_backend_matches_torch_and_closes_cleanly(
     assert backend.model_path == path
     assert backend.input_name == "images"
     assert backend.output_name == "logits"
+    assert backend.expected_output_size == 6
     assert "CPUExecutionProvider" in backend.session.get_providers()
     assert actual.shape == (4, 6)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
@@ -206,9 +255,27 @@ def test_onnx_backend_validates_paths_shapes_and_providers(
     with pytest.raises(FileNotFoundError, match="does not exist"):
         OnnxBackend(tmp_path / "missing.onnx")
     with pytest.raises(ValueError, match="warmup_batch_size"):
-        OnnxBackend(path, device="cpu", warmup_batch_size=0)
+        OnnxBackend(
+            path,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=6,
+            warmup_batch_size=0,
+        )
     with pytest.raises(ValueError, match="input_shape"):
-        OnnxBackend(path, device="cpu", input_shape=(3, -1, 5))
+        OnnxBackend(
+            path,
+            device="cpu",
+            input_shape=(3, -1, 5),
+            expected_output_size=6,
+        )
+    with pytest.raises(ValueError, match="expected_output_size"):
+        OnnxBackend(
+            path,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=0,
+        )
 
     monkeypatch.setattr(
         "inference_gateway.backends.onnx_backend.ort.get_available_providers",
@@ -218,7 +285,7 @@ def test_onnx_backend_validates_paths_shapes_and_providers(
         ["CUDAExecutionProvider", "CPUExecutionProvider"],
         "cuda",
     )
-    assert resolve_onnx_providers("cuda")[1] == "cuda"
+    assert resolve_onnx_providers("cuda") == (["CUDAExecutionProvider"], "cuda")
 
     monkeypatch.setattr(
         "inference_gateway.backends.onnx_backend.ort.get_available_providers",
@@ -240,12 +307,50 @@ def test_onnx_backend_validates_paths_shapes_and_providers(
         resolve_onnx_providers("tpu")
 
 
+def test_onnx_backend_rejects_silent_cuda_provider_fallback(
+    local_model_and_onnx: tuple[TinyClassifier, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, path = local_model_and_onnx
+    cpu_session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    requested_providers: list[list[str]] = []
+
+    monkeypatch.setattr(
+        ort,
+        "get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    def fallback_session(*_args: object, **kwargs: object) -> ort.InferenceSession:
+        providers = kwargs.get("providers")
+        assert isinstance(providers, list)
+        requested_providers.append(providers)
+        return cpu_session
+
+    monkeypatch.setattr(ort, "InferenceSession", fallback_session)
+
+    with pytest.raises(BackendConfigurationError, match="silently fell back"):
+        OnnxBackend(
+            path,
+            device="cuda",
+            input_shape=(3, 5, 5),
+            expected_output_size=6,
+        )
+
+    assert requested_providers == [["CUDAExecutionProvider"]]
+
+
 def test_onnx_backend_rejects_invalid_runtime_output(
     local_model_and_onnx: tuple[TinyClassifier, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, path = local_model_and_onnx
-    backend = OnnxBackend(path, device="cpu")
+    backend = OnnxBackend(
+        path,
+        device="cpu",
+        input_shape=(3, 5, 5),
+        expected_output_size=6,
+    )
     batch = np.zeros((2, 3, 5, 5), dtype=np.float32)
 
     def wrong_output(
@@ -255,5 +360,124 @@ def test_onnx_backend_rejects_invalid_runtime_output(
         return [np.zeros((1, 6), dtype=np.float32)]
 
     monkeypatch.setattr(backend.session, "run", wrong_output)
-    with pytest.raises(BackendExecutionError, match="invalid batch shape"):
+    with pytest.raises(BackendExecutionError, match="invalid classifier output shape"):
         backend.predict_logits(batch)
+
+
+def test_onnx_backend_rejects_multiple_outputs_and_non_float_tensors(tmp_path: Path) -> None:
+    multiple_outputs = _write_identity_onnx(tmp_path / "multiple.onnx", output_count=2)
+    with pytest.raises(BackendConfigurationError, match="exactly one ONNX output"):
+        OnnxBackend(
+            multiple_outputs,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=3 * 5 * 5,
+        )
+
+    double_model = _write_identity_onnx(
+        tmp_path / "double.onnx",
+        element_type=TensorProto.DOUBLE,
+    )
+    with pytest.raises(BackendConfigurationError, match=r"input must be tensor\(float\)"):
+        OnnxBackend(
+            double_model,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=3 * 5 * 5,
+        )
+
+    double_output = _write_identity_onnx(
+        tmp_path / "double-output.onnx",
+        output_element_type=TensorProto.DOUBLE,
+    )
+    with pytest.raises(BackendConfigurationError, match=r"output must be tensor\(float\)"):
+        OnnxBackend(
+            double_output,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=3 * 5 * 5,
+        )
+
+
+def test_onnx_backend_rejects_wrong_production_and_test_seam_tails(
+    local_model_and_onnx: tuple[TinyClassifier, Path],
+) -> None:
+    _, path = local_model_and_onnx
+    with pytest.raises(BackendConfigurationError, match="input tail"):
+        OnnxBackend(path, device="cpu", expected_output_size=6)
+    with pytest.raises(BackendConfigurationError, match="classifier output"):
+        OnnxBackend(path, device="cpu", input_shape=(3, 5, 5))
+    with pytest.raises(BackendConfigurationError, match="input tail"):
+        OnnxBackend(
+            path,
+            device="cpu",
+            input_shape=(3, 4, 5),
+            expected_output_size=6,
+        )
+
+
+@pytest.mark.parametrize(
+    ("input_batch", "output_batch", "role"),
+    [(1, "batch", "input"), ("batch", 1, "output")],
+)
+def test_onnx_backend_rejects_static_batch_dimensions(
+    tmp_path: Path,
+    input_batch: str | int,
+    output_batch: str | int,
+    role: str,
+) -> None:
+    path = _write_identity_onnx(
+        tmp_path / f"static-{role}.onnx",
+        input_batch_dimension=input_batch,
+        output_batch_dimension=output_batch,
+    )
+
+    with pytest.raises(
+        BackendConfigurationError,
+        match=rf"{role} batch dimension must be dynamic",
+    ):
+        OnnxBackend(
+            path,
+            device="cpu",
+            input_shape=(3, 5, 5),
+            expected_output_size=3 * 5 * 5,
+        )
+
+
+def test_onnx_warmup_rechecks_runtime_output_width(
+    local_model_and_onnx: tuple[TinyClassifier, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, path = local_model_and_onnx
+    backend = OnnxBackend(
+        path,
+        device="cpu",
+        input_shape=(3, 5, 5),
+        expected_output_size=6,
+    )
+
+    def wrong_width(
+        _output_names: list[str],
+        input_feed: dict[str, npt.NDArray[np.float32]],
+    ) -> list[npt.NDArray[np.float32]]:
+        batch_size = next(iter(input_feed.values())).shape[0]
+        return [np.zeros((batch_size, 5), dtype=np.float32)]
+
+    monkeypatch.setattr(backend.session, "run", wrong_width)
+    with pytest.raises(BackendExecutionError, match="invalid classifier output shape"):
+        backend.warmup()
+
+
+def test_onnx_predict_rejects_the_wrong_input_tail(
+    local_model_and_onnx: tuple[TinyClassifier, Path],
+) -> None:
+    _, path = local_model_and_onnx
+    backend = OnnxBackend(
+        path,
+        device="cpu",
+        input_shape=(3, 5, 5),
+        expected_output_size=6,
+    )
+
+    with pytest.raises(BackendExecutionError, match="ONNX input tail"):
+        backend.predict_logits(np.zeros((1, 3, 4, 5), dtype=np.float32))

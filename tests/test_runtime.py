@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -124,6 +125,7 @@ async def test_backend_executor_keeps_event_loop_responsive() -> None:
 
     assert await executor.warmup() >= 0.0
     assert backend.warmed_up
+    submitted_at = time.monotonic()
     inference = asyncio.create_task(executor.execute(np.ones((1, 2), dtype=np.float32)))
     assert await asyncio.to_thread(backend.entered.wait, 1.0)
 
@@ -136,6 +138,7 @@ async def test_backend_executor_keeps_event_loop_responsive() -> None:
     execution = await inference
     np.testing.assert_array_equal(execution.logits, np.array([[1.0, 2.0]], dtype=np.float32))
     assert execution.duration_ms >= 0.0
+    assert submitted_at <= execution.started_at_monotonic <= time.monotonic()
 
     await executor.close()
     await executor.close()

@@ -83,12 +83,12 @@ class GatewayMetrics:
 
         self.request_count = Counter(
             "inference_gateway_requests_total",
-            "Logical inference requests received by the scheduler.",
+            "HTTP prediction requests received by the gateway.",
             registry=self.registry,
         )
         self.request_failure_count = Counter(
             "inference_gateway_request_failures_total",
-            "Logical requests that ended in rejection, timeout, cancellation, or failure.",
+            "HTTP prediction requests that completed with a non-success status.",
             registry=self.registry,
         )
         self.queue_rejection_count = Counter(
@@ -103,7 +103,7 @@ class GatewayMetrics:
         )
         self.request_latency = Histogram(
             "inference_gateway_request_latency_seconds",
-            "Scheduler admission-to-completion latency for successful requests.",
+            "End-to-end HTTP prediction latency, including upload parsing and preprocessing.",
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
@@ -142,7 +142,6 @@ class GatewayMetrics:
     def record_queue_rejection(self) -> None:
         if self.queue_rejection_count is not None:
             self.queue_rejection_count.inc()
-        self.record_failure()
 
     def set_queue_depth(self, depth: int) -> None:
         if self.queue_depth is not None:

@@ -7,6 +7,7 @@ which keeps imports and unit tests offline-safe.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 from functools import cache
 from io import BytesIO
@@ -19,12 +20,21 @@ from PIL import Image, UnidentifiedImageError
 from torchvision.models import ResNet18_Weights
 
 SUPPORTED_IMAGE_FORMATS = frozenset({"JPEG", "PNG"})
+# Converting the largest accepted image to RGB requires roughly 75 MB before
+# torchvision creates its resized tensor.  This is intentionally well below
+# Pillow's process-wide decompression-bomb warning threshold.
+MAX_DECODED_PIXELS = 25_000_000
 
 
 class ImageDecodeError(ValueError):
     """Raised when an upload cannot be decoded as an accepted image."""
 
-    def __init__(self, message: str, *, reason: Literal["malformed", "unsupported"]) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: Literal["malformed", "unsupported", "too_large"],
+    ) -> None:
         super().__init__(message)
         self.reason = reason
 
@@ -48,6 +58,26 @@ class UnsupportedImageFormatError(ImageDecodeError):
         self.image_format = image_format
 
 
+class ImageTooLargeError(ImageDecodeError):
+    """Raised before decoding when an image's declared dimensions are unsafe."""
+
+    def __init__(
+        self,
+        width: int | None = None,
+        height: int | None = None,
+        *,
+        max_pixels: int = MAX_DECODED_PIXELS,
+    ) -> None:
+        dimensions = f" ({width}x{height})" if width is not None and height is not None else ""
+        super().__init__(
+            f"Image dimensions{dimensions} exceed the {max_pixels:,}-pixel decoded limit.",
+            reason="too_large",
+        )
+        self.width = width
+        self.height = height
+        self.max_pixels = max_pixels
+
+
 def decode_image(payload: bytes | bytearray | memoryview) -> Image.Image:
     """Decode *payload*, enforce JPEG/PNG, and return an independent RGB image.
 
@@ -62,14 +92,21 @@ def decode_image(payload: bytes | bytearray | memoryview) -> Image.Image:
         raise MalformedImageError("The uploaded image is empty.")
 
     try:
-        with BytesIO(raw) as stream, Image.open(stream) as decoded:
-            image_format = decoded.format.upper() if decoded.format else None
-            if image_format not in SUPPORTED_IMAGE_FORMATS:
-                raise UnsupportedImageFormatError(image_format)
-            decoded.load()
-            return decoded.convert("RGB")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with BytesIO(raw) as stream, Image.open(stream) as decoded:
+                image_format = decoded.format.upper() if decoded.format else None
+                if image_format not in SUPPORTED_IMAGE_FORMATS:
+                    raise UnsupportedImageFormatError(image_format)
+                width, height = decoded.size
+                if width * height > MAX_DECODED_PIXELS:
+                    raise ImageTooLargeError(width, height)
+                decoded.load()
+                return decoded.convert("RGB")
     except ImageDecodeError:
         raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ImageTooLargeError() from exc
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise MalformedImageError() from exc
 
@@ -138,8 +175,10 @@ preprocess_image_bytes = preprocess_image
 
 
 __all__ = [
+    "MAX_DECODED_PIXELS",
     "SUPPORTED_IMAGE_FORMATS",
     "ImageDecodeError",
+    "ImageTooLargeError",
     "MalformedImageError",
     "UnsupportedImageFormatError",
     "decode_image",

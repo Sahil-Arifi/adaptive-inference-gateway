@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import multiprocessing
 import os
 import platform
 import socket
@@ -16,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import numpy as np
@@ -32,6 +33,9 @@ from inference_gateway.loadgen import (
 )
 
 PRIMARY_CASE_COUNT = 32
+_GRACEFUL_SHUTDOWN_SECONDS = 30.0
+_TERMINATE_SHUTDOWN_SECONDS = 5.0
+_KILL_SHUTDOWN_SECONDS = 5.0
 
 _COUNTER_FIELDS = (
     "total_accepted_requests",
@@ -43,6 +47,31 @@ _COUNTER_FIELDS = (
     "backend_inference_calls",
     "batches_executed",
 )
+
+
+class _StopSignal(Protocol):
+    def is_set(self) -> bool: ...
+
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
+
+
+class _ProcessHandle(Protocol):
+    @property
+    def exitcode(self) -> int | None: ...
+
+    def start(self) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,18 +398,18 @@ def _open_loopback_socket() -> socket.socket:
 
 async def _wait_until_ready(
     base_url: str,
-    server_task: asyncio.Task[None],
+    process: _ProcessHandle,
     *,
     timeout_seconds: float,
 ) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
         while asyncio.get_running_loop().time() < deadline:
-            if server_task.done():
-                exception = server_task.exception()
-                if exception is not None:
-                    raise RuntimeError("benchmark server failed during startup") from exception
-                raise RuntimeError("benchmark server exited before becoming ready")
+            if not process.is_alive():
+                raise RuntimeError(
+                    "benchmark server process exited before becoming ready "
+                    f"(exit code {process.exitcode})"
+                )
             try:
                 response = await client.get(f"{base_url}/readyz")
                 if response.status_code == 200:
@@ -393,51 +422,145 @@ async def _wait_until_ready(
     raise TimeoutError(f"benchmark server did not become ready within {timeout_seconds}s")
 
 
-@asynccontextmanager
-async def _loopback_server(
+async def _serve_until_stopped(
     settings: GatewaySettings,
-    *,
-    startup_timeout_seconds: float = 300.0,
-) -> AsyncIterator[str]:
-    # Import lazily so matrix construction/report tests need not initialize FastAPI.
+    sock: socket.socket,
+    stop_signal: _StopSignal,
+) -> None:
+    """Own Uvicorn and its event loop inside the benchmark child process."""
+
     from inference_gateway.service import create_app
 
-    sock = _open_loopback_socket()
     address = sock.getsockname()
     if not isinstance(address, tuple) or len(address) < 2:
-        sock.close()
         raise RuntimeError("could not determine loopback server address")
     port = int(address[1])
-    server_settings = _settings_with_port(settings, port)
-    app = create_app(server_settings)
+    app = create_app(_settings_with_port(settings, port))
     config = uvicorn.Config(
         app,
         host="127.0.0.1",
         port=port,
+        loop="asyncio",
         log_level="warning",
         access_log=False,
         lifespan="on",
     )
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve(sockets=[sock]), name="benchmark-uvicorn")
-    base_url = f"http://127.0.0.1:{port}"
+    stop_task = asyncio.create_task(
+        asyncio.to_thread(stop_signal.wait),
+        name="benchmark-stop-signal",
+    )
     try:
+        done, _ = await asyncio.wait(
+            {server_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done and not server_task.done():
+            server.should_exit = True
+        await server_task
+    finally:
+        # Also release the waiting thread if Uvicorn exits on its own.
+        stop_signal.set()
+        await asyncio.gather(stop_task, return_exceptions=True)
+
+
+def _server_process_main(
+    settings_payload: dict[str, Any],
+    sock: socket.socket,
+    stop_signal: _StopSignal,
+) -> None:
+    """Spawn-safe child entrypoint; production backends never touch the parent loop."""
+
+    try:
+        settings = GatewaySettings.model_validate(settings_payload)
+        asyncio.run(_serve_until_stopped(settings, sock, stop_signal))
+    finally:
+        sock.close()
+
+
+def _create_server_process(
+    settings: GatewaySettings,
+    sock: socket.socket,
+) -> tuple[_ProcessHandle, _StopSignal]:
+    context = multiprocessing.get_context("spawn")
+    stop_signal = context.Event()
+    process = context.Process(
+        target=_server_process_main,
+        args=(settings.model_dump(mode="json"), sock, stop_signal),
+        name="inference-benchmark-server",
+        daemon=False,
+    )
+    return process, stop_signal
+
+
+async def _join_without_blocking(process: _ProcessHandle, timeout_seconds: float) -> None:
+    await asyncio.to_thread(process.join, timeout_seconds)
+
+
+async def _stop_server_process(
+    process: _ProcessHandle,
+    stop_signal: _StopSignal,
+) -> int | None:
+    """Request graceful shutdown, then enforce a bounded teardown."""
+
+    stop_signal.set()
+    await _join_without_blocking(process, _GRACEFUL_SHUTDOWN_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        await _join_without_blocking(process, _TERMINATE_SHUTDOWN_SECONDS)
+    if process.is_alive():
+        process.kill()
+        await _join_without_blocking(process, _KILL_SHUTDOWN_SECONDS)
+    if process.is_alive():
+        raise RuntimeError("benchmark server process could not be stopped")
+    exitcode = process.exitcode
+    process.close()
+    return exitcode
+
+
+@asynccontextmanager
+async def _loopback_server(
+    settings: GatewaySettings,
+    *,
+    startup_timeout_seconds: float = 300.0,
+) -> AsyncIterator[str]:
+    sock = _open_loopback_socket()
+    address = sock.getsockname()
+    if not isinstance(address, tuple) or len(address) < 2:
+        sock.close()
+        raise RuntimeError("could not determine loopback server address")
+    port = int(address[1])
+    process, stop_signal = _create_server_process(settings, sock)
+    process_started = False
+    base_url = f"http://127.0.0.1:{port}"
+    active_error: BaseException | None = None
+    try:
+        process.start()
+        process_started = True
+        # The spawned child owns the duplicated listening socket after start().
+        sock.close()
         await _wait_until_ready(
             base_url,
-            server_task,
+            process,
             timeout_seconds=startup_timeout_seconds,
         )
         yield base_url
+    except BaseException as exc:
+        active_error = exc
+        raise
     finally:
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(server_task, timeout=60.0)
-        except TimeoutError:
-            server.force_exit = True
-            server_task.cancel()
-            await asyncio.gather(server_task, return_exceptions=True)
-        finally:
+        if not process_started:
             sock.close()
+            process.close()
+        else:
+            exitcode = await _stop_server_process(process, stop_signal)
+            if active_error is None and exitcode not in (0, None):
+                raise RuntimeError(
+                    f"benchmark server process exited with code {exitcode}"
+                )
+
+
 def _environment_metadata() -> dict[str, Any]:
     def package_version(distribution: str) -> str | None:
         try:
@@ -504,7 +627,11 @@ def _require_parity(settings: GatewaySettings, parity_path: Path) -> dict[str, A
     # This helper validates pass status and binds the report to the exact ONNX hash.
     from inference_gateway.parity import require_passing_parity
 
-    require_passing_parity(parity_path, settings.model.onnx_path)
+    require_passing_parity(
+        parity_path,
+        settings.model.onnx_path,
+        expected_device=settings.model.device.value,
+    )
     return _read_json_object(parity_path)
 
 
@@ -580,10 +707,10 @@ async def run_benchmark(
         cases=tuple(results),
     )
 
-    from inference_gateway.reporting import write_benchmark_artifacts
+    from inference_gateway.reporting import seal_benchmark_results, write_benchmark_artifacts
 
     write_benchmark_artifacts(
-        suite.to_dict(),
+        seal_benchmark_results(suite.to_dict()),
         output_directory,
         update_readme=update_readme,
         readme_path=readme_path,
