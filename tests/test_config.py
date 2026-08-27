@@ -14,13 +14,22 @@ from inference_gateway.config import (
 )
 
 
-def test_default_config_loads_required_benchmark_matrix() -> None:
+@pytest.mark.parametrize(
+    "config_path",
+    ["configs/default.yaml", "configs/benchmark.yaml", "configs/docker-smoke.yaml"],
+)
+def test_repository_configs_load_required_benchmark_matrix(config_path: str) -> None:
+    settings = load_config(config_path)
+
+    assert settings.benchmark.primary_case_count == 32
+    assert settings.benchmark.dynamic_concurrency == [8, 32, 64]
+
+
+def test_default_config_uses_onnx_dynamic_scheduler() -> None:
     settings = load_config("configs/default.yaml")
 
     assert settings.model.backend is BackendName.ONNX
     assert settings.scheduler.mode is SchedulerMode.DYNAMIC
-    assert settings.benchmark.primary_case_count == 32
-    assert settings.benchmark.dynamic_concurrency == [8, 32, 64]
 
 
 def test_missing_config_raises_clear_error(tmp_path: Path) -> None:
