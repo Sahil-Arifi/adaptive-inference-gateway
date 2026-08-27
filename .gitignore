@@ -20,6 +20,12 @@ htmlcov/
 *.pth
 artifacts/*
 !artifacts/.gitkeep
+!artifacts/parity.json
+!artifacts/results.json
+!artifacts/results.csv
+!artifacts/report.md
+!artifacts/throughput_vs_p95.png
+!artifacts/batch_efficiency.png
 
 # Editors and operating systems
 .idea/
