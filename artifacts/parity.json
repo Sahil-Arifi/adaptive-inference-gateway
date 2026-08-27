@@ -1,0 +1,55 @@
+{
+  "atol": 1e-05,
+  "batch_sizes": [
+    1,
+    4,
+    16
+  ],
+  "device": "cpu",
+  "input_name": "images",
+  "input_shape": [
+    3,
+    224,
+    224
+  ],
+  "max_abs_difference": 4.291534423828125e-06,
+  "mean_abs_difference": 6.158993402052494e-07,
+  "model_name": "resnet18",
+  "onnx_path": "artifacts\\resnet18.onnx",
+  "onnx_sha256": "100db70894fa9f416718901627d1d399997d0de91d462311aafef0e002441416",
+  "output_name": "logits",
+  "passed": true,
+  "per_batch": [
+    {
+      "allclose": true,
+      "batch_size": 1,
+      "logit_count": 1000,
+      "max_abs_difference": 3.337860107421875e-06,
+      "mean_abs_difference": 5.346238613128662e-07,
+      "passed": true,
+      "top1_agreement": 1.0
+    },
+    {
+      "allclose": true,
+      "batch_size": 4,
+      "logit_count": 4000,
+      "max_abs_difference": 4.291534423828125e-06,
+      "mean_abs_difference": 6.17647310718894e-07,
+      "passed": true,
+      "top1_agreement": 1.0
+    },
+    {
+      "allclose": true,
+      "batch_size": 16,
+      "logit_count": 16000,
+      "max_abs_difference": 4.291534423828125e-06,
+      "mean_abs_difference": 6.205420650076121e-07,
+      "passed": true,
+      "top1_agreement": 1.0
+    }
+  ],
+  "rtol": 0.0001,
+  "schema_version": 1,
+  "seed": 2027,
+  "top1_agreement": 1.0
+}
