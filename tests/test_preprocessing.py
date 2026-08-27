@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+import zlib
 from io import BytesIO
 
 import numpy as np
@@ -9,7 +11,9 @@ from PIL import Image
 from torchvision.models import ResNet18_Weights
 
 from inference_gateway.preprocessing import (
+    MAX_DECODED_PIXELS,
     ImageDecodeError,
+    ImageTooLargeError,
     MalformedImageError,
     UnsupportedImageFormatError,
     decode_image,
@@ -31,6 +35,19 @@ def _encoded_image(image_format: str, *, mode: str = "RGB") -> bytes:
     buffer = BytesIO()
     image.save(buffer, format=image_format)
     return buffer.getvalue()
+
+
+def _png_dimensions_only(width: int, height: int) -> bytes:
+    """Build a tiny PNG header declaring dimensions without storing pixels."""
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+
+    def chunk(name: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(name + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", checksum)
+
+    return signature + chunk(b"IHDR", ihdr_data) + chunk(b"IEND", b"")
 
 
 @pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
@@ -79,6 +96,43 @@ def test_valid_but_unsupported_image_is_distinguished() -> None:
 
     assert error.value.reason == "unsupported"
     assert error.value.image_format == "GIF"
+
+
+def test_explicit_decoded_pixel_cap_runs_before_pixel_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 5_001
+    height = 5_000
+    payload = _png_dimensions_only(width, height)
+    assert len(payload) < 100
+    assert width * height > MAX_DECODED_PIXELS
+
+    def unexpected_load(_image: Image.Image) -> None:
+        raise AssertionError("oversized image pixels must never be loaded")
+
+    monkeypatch.setattr("PIL.PngImagePlugin.PngImageFile.load", unexpected_load)
+    with pytest.raises(ImageTooLargeError, match="decoded limit") as error:
+        decode_image(payload)
+
+    assert isinstance(error.value, ImageDecodeError)
+    assert error.value.reason == "too_large"
+    assert error.value.width == width
+    assert error.value.height == height
+    assert error.value.max_pixels == MAX_DECODED_PIXELS
+
+
+@pytest.mark.parametrize("dimensions", [(10_000, 10_000), (20_000, 20_000)])
+def test_pillow_decompression_bomb_paths_are_typed(
+    dimensions: tuple[int, int],
+) -> None:
+    payload = _png_dimensions_only(*dimensions)
+    assert len(payload) < 100
+
+    with pytest.raises(ImageTooLargeError) as error:
+        decode_image(payload)
+
+    assert error.value.reason == "too_large"
+    assert error.value.__cause__ is not None
 
 
 def test_decode_rejects_non_bytes_payload() -> None:

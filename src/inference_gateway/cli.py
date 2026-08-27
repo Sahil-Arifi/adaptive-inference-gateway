@@ -64,6 +64,7 @@ def parity_command(
         settings.model.onnx_path,
         destination,
         device=settings.model.device.value,
+        model_name=settings.model.architecture,
     )
     console.print_json(data=report.to_dict())
 

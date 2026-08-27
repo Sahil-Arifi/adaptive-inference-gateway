@@ -60,6 +60,7 @@ class BackendExecution:
 
     logits: NDArray[np.generic]
     duration_ms: float
+    started_at_monotonic: float
 
 
 class BackendExecutor:
@@ -87,10 +88,15 @@ class BackendExecutor:
             raise SchedulerClosedError("backend executor is closed")
 
         def invoke() -> BackendExecution:
+            started_at_monotonic = time.monotonic()
             started = time.perf_counter()
             output = self.backend.predict_logits(batch)
             duration_ms = (time.perf_counter() - started) * 1000.0
-            return BackendExecution(logits=np.asarray(output), duration_ms=duration_ms)
+            return BackendExecution(
+                logits=np.asarray(output),
+                duration_ms=duration_ms,
+                started_at_monotonic=started_at_monotonic,
+            )
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, invoke)

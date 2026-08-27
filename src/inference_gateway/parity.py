@@ -15,10 +15,21 @@ import onnxruntime as ort
 import torch
 from torch import nn
 
-from inference_gateway.backends.onnx_backend import resolve_onnx_providers
+from inference_gateway.backends.base import BackendConfigurationError
+from inference_gateway.backends.onnx_backend import (
+    resolve_active_onnx_device,
+    resolve_onnx_providers,
+)
 from inference_gateway.backends.torch_backend import resolve_torch_device
 
 PARITY_SCHEMA_VERSION = 1
+PRODUCTION_PARITY_ATOL = 1e-5
+PRODUCTION_PARITY_BATCH_SIZES = (1, 4, 16)
+PRODUCTION_PARITY_DEVICE = "cpu"
+PRODUCTION_PARITY_INPUT_SHAPE = (3, 224, 224)
+PRODUCTION_PARITY_MODEL_NAME = "resnet18"
+PRODUCTION_PARITY_OUTPUT_SIZE = 1000
+PRODUCTION_PARITY_RTOL = 1e-4
 
 
 class ParityVerificationError(RuntimeError):
@@ -253,6 +264,7 @@ def verify_parity(
     atol: float = 1e-5,
     seed: int = 2027,
     device: str = "cpu",
+    model_name: str | None = None,
 ) -> ParityReport:
     """Compare both runtimes on the exact same deterministic input tensors."""
 
@@ -292,6 +304,20 @@ def verify_parity(
         session = ort.InferenceSession(str(path), providers=providers)
     except Exception as exc:
         raise ParityVerificationError(f"ONNX Runtime could not load {path}.") from exc
+    try:
+        active_onnx_device = resolve_active_onnx_device(
+            session,
+            expected_device=resolved_onnx_device,
+        )
+    except BackendConfigurationError as exc:
+        raise ParityVerificationError(
+            "ONNX Runtime did not activate the device selected for parity."
+        ) from exc
+    if torch_device.type != active_onnx_device:
+        raise ParityVerificationError(
+            "PyTorch and the active ONNX Runtime provider use different device types: "
+            f"{torch_device.type} and {active_onnx_device}."
+        )
     inputs = session.get_inputs()
     outputs = session.get_outputs()
     if len(inputs) != 1 or not outputs:
@@ -362,9 +388,13 @@ def verify_parity(
         total_top1_matches += matches
         total_predictions += batch_size
 
+    resolved_model_name = model_name if model_name is not None else type(model).__name__
+    if not isinstance(resolved_model_name, str) or not resolved_model_name:
+        raise ValueError("model_name must be a non-empty string.")
+
     return ParityReport(
         schema_version=PARITY_SCHEMA_VERSION,
-        model_name=type(model).__name__,
+        model_name=resolved_model_name,
         onnx_path=str(path),
         onnx_sha256=sha256_file(path),
         input_name=inputs[0].name,
@@ -373,7 +403,7 @@ def verify_parity(
         rtol=float(rtol),
         atol=float(atol),
         seed=seed,
-        device=str(torch_device),
+        device=active_onnx_device,
         per_batch=tuple(results),
         max_abs_difference=max(result.max_abs_difference for result in results),
         mean_abs_difference=absolute_sum / total_logits,
@@ -409,9 +439,65 @@ def load_parity_report(source: str | Path) -> ParityReport:
         raise ParityVerificationError(f"Invalid parity report: {path}") from exc
 
 
+def validate_production_parity_policy(
+    report: ParityReport,
+    *,
+    expected_device: str = PRODUCTION_PARITY_DEVICE,
+) -> None:
+    """Validate production benchmark parity evidence without reading external files."""
+
+    policy_errors: list[str] = []
+    if not report.passed or not all(result.passed for result in report.per_batch):
+        policy_errors.append("the report records a failed comparison")
+    if report.model_name != PRODUCTION_PARITY_MODEL_NAME:
+        policy_errors.append(
+            f"model identity must be {PRODUCTION_PARITY_MODEL_NAME!r}, "
+            f"found {report.model_name!r}"
+        )
+    if report.input_shape != PRODUCTION_PARITY_INPUT_SHAPE:
+        policy_errors.append(
+            f"input shape must be {PRODUCTION_PARITY_INPUT_SHAPE}, "
+            f"found {report.input_shape}"
+        )
+    if report.batch_sizes != PRODUCTION_PARITY_BATCH_SIZES:
+        policy_errors.append(
+            f"batch sizes must be exactly {PRODUCTION_PARITY_BATCH_SIZES}, "
+            f"found {report.batch_sizes}"
+        )
+    if report.rtol != PRODUCTION_PARITY_RTOL:
+        policy_errors.append(
+            f"rtol must be {PRODUCTION_PARITY_RTOL}, found {report.rtol}"
+        )
+    if report.atol != PRODUCTION_PARITY_ATOL:
+        policy_errors.append(
+            f"atol must be {PRODUCTION_PARITY_ATOL}, found {report.atol}"
+        )
+    if report.device != expected_device:
+        policy_errors.append(
+            f"device must be {expected_device!r} for the configured benchmark, "
+            f"found {report.device!r}"
+        )
+    invalid_output_batches = tuple(
+        result.batch_size
+        for result in report.per_batch
+        if result.logit_count != result.batch_size * PRODUCTION_PARITY_OUTPUT_SIZE
+    )
+    if invalid_output_batches:
+        policy_errors.append(
+            f"classifier output must contain {PRODUCTION_PARITY_OUTPUT_SIZE} logits per image"
+        )
+    if policy_errors:
+        raise ParityVerificationError(
+            "The parity report does not satisfy the production benchmark policy: "
+            + "; ".join(policy_errors)
+        )
+
+
 def require_passing_parity(
     parity_path: str | Path,
     onnx_path: str | Path,
+    *,
+    expected_device: str = PRODUCTION_PARITY_DEVICE,
 ) -> ParityReport:
     """Reject missing, failed, malformed, or stale parity evidence."""
 
@@ -419,13 +505,12 @@ def require_passing_parity(
     if not model_path.is_file():
         raise ParityVerificationError(f"ONNX model does not exist: {model_path}")
     report = load_parity_report(parity_path)
-    if not report.passed or not all(result.passed for result in report.per_batch):
-        raise ParityVerificationError("The parity report records a failed comparison.")
     actual_sha256 = sha256_file(model_path)
     if report.onnx_sha256 != actual_sha256:
         raise ParityVerificationError(
             "The parity report does not match the current ONNX artifact SHA-256."
         )
+    validate_production_parity_policy(report, expected_device=expected_device)
     return report
 
 
@@ -440,6 +525,7 @@ def verify_and_write_parity(
     atol: float = 1e-5,
     seed: int = 2027,
     device: str = "cpu",
+    model_name: str | None = None,
 ) -> ParityReport:
     """Run parity, write its evidence, and fail closed when it does not pass."""
 
@@ -452,6 +538,7 @@ def verify_and_write_parity(
         atol=atol,
         seed=seed,
         device=device,
+        model_name=model_name,
     )
     write_parity_report(report, destination)
     if not report.passed:
@@ -465,6 +552,13 @@ compare_pytorch_onnx = verify_parity
 
 __all__ = [
     "PARITY_SCHEMA_VERSION",
+    "PRODUCTION_PARITY_ATOL",
+    "PRODUCTION_PARITY_BATCH_SIZES",
+    "PRODUCTION_PARITY_DEVICE",
+    "PRODUCTION_PARITY_INPUT_SHAPE",
+    "PRODUCTION_PARITY_MODEL_NAME",
+    "PRODUCTION_PARITY_OUTPUT_SIZE",
+    "PRODUCTION_PARITY_RTOL",
     "BatchParityResult",
     "ParityReport",
     "ParityVerificationError",
@@ -472,6 +566,7 @@ __all__ = [
     "load_parity_report",
     "require_passing_parity",
     "sha256_file",
+    "validate_production_parity_policy",
     "verify_and_write_parity",
     "verify_parity",
     "write_parity_report",

@@ -178,14 +178,12 @@ class _BaseScheduler:
         if not request.expire():
             return False
         self.stats.record_timeout()
-        self.metrics.record_failure()
         return True
 
     def _cancel(self, request: PendingRequest) -> bool:
         if not request.cancel():
             return False
         self.stats.record_cancelled()
-        self.metrics.record_failure()
         return True
 
     async def _await_result(self, request: PendingRequest) -> ScheduledResult:
@@ -193,14 +191,23 @@ class _BaseScheduler:
         if remaining <= 0:
             self._expire(request)
             raise DeadlineExceededError(f"request {request.request_id} exceeded its deadline")
+        deadline_timeout = asyncio.timeout(remaining)
         try:
-            return await asyncio.wait_for(asyncio.shield(request.future), timeout=remaining)
+            async with deadline_timeout:
+                return await asyncio.shield(request.future)
         except TimeoutError as error:
+            if not deadline_timeout.expired():
+                raise
             self._expire(request)
             raise DeadlineExceededError(
                 f"request {request.request_id} exceeded its deadline"
             ) from error
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if request.expired(time.monotonic()):
+                self._expire(request)
+                raise DeadlineExceededError(
+                    f"request {request.request_id} exceeded its deadline"
+                ) from error
             self._cancel(request)
             raise
 
@@ -225,21 +232,25 @@ class _BaseScheduler:
             for request in active:
                 if request.reject(error):
                     self.stats.record_failed()
-                    self.metrics.record_failure()
             return
 
-        execution_started = time.monotonic()
+        executor_submitted_at = time.monotonic()
         queue_waits_ms = [
-            max((execution_started - request.enqueued_at) * 1000.0, 0.0)
+            max((executor_submitted_at - request.enqueued_at) * 1000.0, 0.0)
             for request in active
         ]
-        for queue_wait_ms in queue_waits_ms:
-            self.metrics.observe_queue_wait(queue_wait_ms)
 
         measured_ms = 0.0
         try:
             execution = await self._executor.execute(batch)
             measured_ms = execution.duration_ms
+            queue_waits_ms = [
+                max(
+                    (execution.started_at_monotonic - request.enqueued_at) * 1000.0,
+                    0.0,
+                )
+                for request in active
+            ]
             logits = np.asarray(execution.logits)
             if logits.ndim < 1 or logits.shape[0] != len(active):
                 raise ValueError(
@@ -248,15 +259,21 @@ class _BaseScheduler:
                 )
         except Exception as error:
             if measured_ms == 0.0:
-                measured_ms = max((time.monotonic() - execution_started) * 1000.0, 0.0)
+                measured_ms = max(
+                    (time.monotonic() - executor_submitted_at) * 1000.0,
+                    0.0,
+                )
+            for queue_wait_ms in queue_waits_ms:
+                self.metrics.observe_queue_wait(queue_wait_ms)
             self.stats.record_batch(len(active), measured_ms, queue_waits_ms)
             self.metrics.record_backend_call(measured_ms, len(active))
             for request in active:
                 if request.reject(error):
                     self.stats.record_failed()
-                    self.metrics.record_failure()
             return
 
+        for queue_wait_ms in queue_waits_ms:
+            self.metrics.observe_queue_wait(queue_wait_ms)
         self.stats.record_batch(len(active), measured_ms, queue_waits_ms)
         self.metrics.record_backend_call(measured_ms, len(active))
         completed_at = time.monotonic()
@@ -275,9 +292,6 @@ class _BaseScheduler:
             )
             if request.resolve(result):
                 self.stats.record_completed()
-                self.metrics.observe_request_latency(
-                    max((completed_at - request.enqueued_at) * 1000.0, 0.0)
-                )
 
     async def _close_owned_executor(self) -> None:
         if self._owns_executor:
@@ -316,7 +330,10 @@ class DirectScheduler(_BaseScheduler):
         )
         self._running = False
         self._requests: dict[int, PendingRequest] = {}
-        self._tasks: set[asyncio.Task[None]] = set()
+        # A task owns one admission slot until its backend execution coroutine
+        # actually finishes. The caller Future may time out or be cancelled
+        # earlier, but that must not reopen capacity while blocking work remains.
+        self._admitted_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def running(self) -> bool:
@@ -326,6 +343,9 @@ class DirectScheduler(_BaseScheduler):
     def queue_depth(self) -> int:
         # Direct requests never enter the dynamic request queue.
         return 0
+
+    def _release_admission(self, task: asyncio.Task[None]) -> None:
+        self._admitted_tasks.discard(task)
 
     async def start(self) -> None:
         if self._closed:
@@ -343,10 +363,9 @@ class DirectScheduler(_BaseScheduler):
         deadline_monotonic: float | None = None,
         timeout_ms: float | None = None,
     ) -> ScheduledResult:
-        self.metrics.record_request()
         if not self.running:
             raise SchedulerClosedError("direct scheduler is not running")
-        if sum(request.active for request in self._requests.values()) >= self.max_queue_size:
+        if len(self._admitted_tasks) >= self.max_queue_size:
             self.stats.record_rejected()
             self.metrics.record_queue_rejection()
             raise QueueFullError("direct scheduler capacity is full")
@@ -363,8 +382,8 @@ class DirectScheduler(_BaseScheduler):
                 self._execute_requests([request]),
                 name=f"direct-inference-{request_id}",
             )
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._admitted_tasks.add(task)
+            task.add_done_callback(self._release_admission)
 
         try:
             return await self._await_result(request)
@@ -380,12 +399,12 @@ class DirectScheduler(_BaseScheduler):
         close_error = SchedulerClosedError("direct scheduler closed before request completion")
         for request in tuple(self._requests.values()):
             request.reject(close_error)
-        tasks = tuple(self._tasks)
+        tasks = tuple(self._admitted_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
+        self._admitted_tasks.clear()
         self.stats.update_queue_depth(0)
         self.metrics.set_queue_depth(0)
         await self._close_owned_executor()
@@ -470,7 +489,6 @@ class DynamicBatchScheduler(_BaseScheduler):
         deadline_monotonic: float | None = None,
         timeout_ms: float | None = None,
     ) -> ScheduledResult:
-        self.metrics.record_request()
         if not self.running:
             raise SchedulerClosedError("dynamic scheduler is not running")
         now = time.monotonic()
@@ -512,10 +530,12 @@ class DynamicBatchScheduler(_BaseScheduler):
         self._update_queue_depth()
         return request
 
-    async def _collect_batch(self, first: PendingRequest) -> list[PendingRequest]:
-        batch = [first]
+    async def _collect_batch(self) -> None:
+        """Collect into the worker-owned batch visible to shutdown cleanup."""
+
+        first = self._active_batch[0]
         collection_end = first.enqueued_at + (self.max_wait_ms / 1000.0)
-        while len(batch) < self.max_batch_size:
+        while len(self._active_batch) < self.max_batch_size:
             # Requests already queued add no collection delay, so drain them up
             # to the batch limit even when this first request waited behind a
             # previous backend call and its nominal window has elapsed.
@@ -529,7 +549,9 @@ class DynamicBatchScheduler(_BaseScheduler):
 
                 # If consuming the rest of the window could itself cross the
                 # earliest deadline, flush now and leave time for inference.
-                earliest_deadline = min(request.absolute_deadline for request in batch)
+                earliest_deadline = min(
+                    request.absolute_deadline for request in self._active_batch
+                )
                 if earliest_deadline - now <= remaining:
                     break
                 waited_request = await self._wait_for_next_request(remaining)
@@ -553,14 +575,17 @@ class DynamicBatchScheduler(_BaseScheduler):
                 self._queue.task_done()
                 self._update_queue_depth()
                 break
-            batch.append(request)
-        return batch
+            # No await occurs between dequeue and this ownership transfer.
+            # Cancellation cleanup can now see every unfinished queue item.
+            self._active_batch.append(request)
 
     async def _batch_worker(self) -> None:
         try:
             while self._accepting:
                 first = await self._first_active_request()
-                self._active_batch = await self._collect_batch(first)
+                # Publish ownership before collection performs its first await.
+                self._active_batch = [first]
+                await self._collect_batch()
                 await self._execute_requests(self._active_batch)
                 for _request in self._active_batch:
                     self._queue.task_done()

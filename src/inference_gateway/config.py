@@ -58,6 +58,9 @@ class ServerConfig(StrictModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8000, ge=1, le=65535)
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, ge=1)
+    max_in_flight_requests: int = Field(default=64, ge=1)
+    max_preprocessing_queue_size: int = Field(default=64, ge=1)
+    preprocessing_workers: int = Field(default=2, ge=1)
     top_k: int = Field(default=5, ge=1, le=1000)
 
 
@@ -106,6 +109,18 @@ class BenchmarkConfig(StrictModel):
             raise ValueError("wait times must be unique")
         return values
 
+    @model_validator(mode="after")
+    def validate_primary_matrix(self) -> Self:
+        """Keep the named 32-case suite bound to its documented coordinates."""
+
+        if self.concurrency != [1, 8, 32, 64]:
+            raise ValueError("primary benchmark concurrency must be [1, 8, 32, 64]")
+        if self.dynamic_batch_sizes != [8, 16]:
+            raise ValueError("primary dynamic batch sizes must be [8, 16]")
+        if self.dynamic_wait_ms != [1.0, 3.0]:
+            raise ValueError("primary dynamic wait times must be [1.0, 3.0]")
+        return self
+
     @property
     def dynamic_concurrency(self) -> list[int]:
         """Dynamic cases omit serial concurrency by design."""
@@ -149,6 +164,17 @@ class GatewaySettings(BaseSettings):
             raise ValueError(
                 "the primary benchmark matrix must contain exactly 32 cases "
                 f"(configured {self.benchmark.primary_case_count})"
+            )
+        maximum_concurrency = max(self.benchmark.concurrency)
+        if self.server.max_in_flight_requests < maximum_concurrency:
+            raise ValueError(
+                "server.max_in_flight_requests must be at least the maximum "
+                f"benchmark concurrency ({maximum_concurrency})"
+            )
+        if self.server.max_preprocessing_queue_size < maximum_concurrency:
+            raise ValueError(
+                "server.max_preprocessing_queue_size must be at least the maximum "
+                f"benchmark concurrency ({maximum_concurrency})"
             )
         return self
 

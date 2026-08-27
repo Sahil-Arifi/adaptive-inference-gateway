@@ -30,6 +30,7 @@ def test_default_config_uses_onnx_dynamic_scheduler() -> None:
 
     assert settings.model.backend is BackendName.ONNX
     assert settings.scheduler.mode is SchedulerMode.DYNAMIC
+    assert settings.server.max_in_flight_requests == 64
 
 
 def test_missing_config_raises_clear_error(tmp_path: Path) -> None:
@@ -65,8 +66,35 @@ def test_dynamic_collection_window_must_precede_timeout() -> None:
 
 
 def test_invalid_benchmark_matrix_is_rejected() -> None:
-    with pytest.raises(ValidationError, match="exactly 32 cases"):
+    with pytest.raises(ValidationError, match="concurrency must be"):
         GatewaySettings.model_validate({"benchmark": {"concurrency": [1, 8]}})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("concurrency", [1, 7, 33, 65], "concurrency must be"),
+        ("dynamic_batch_sizes", [4, 32], "dynamic batch sizes must be"),
+        ("dynamic_wait_ms", [0.5, 5.0], "dynamic wait times must be"),
+    ],
+)
+def test_primary_benchmark_coordinates_are_canonical(
+    field: str,
+    value: list[int] | list[float],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        GatewaySettings.model_validate({"benchmark": {field: value}})
+
+
+def test_preprocessing_capacity_must_cover_benchmark_concurrency() -> None:
+    with pytest.raises(ValidationError, match="maximum benchmark concurrency"):
+        GatewaySettings.model_validate({"server": {"max_preprocessing_queue_size": 32}})
+
+
+def test_outer_admission_capacity_must_cover_benchmark_concurrency() -> None:
+    with pytest.raises(ValidationError, match="max_in_flight_requests"):
+        GatewaySettings.model_validate({"server": {"max_in_flight_requests": 63}})
 
 
 def test_dumped_config_round_trips(tmp_path: Path) -> None:

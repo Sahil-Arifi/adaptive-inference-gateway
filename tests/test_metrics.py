@@ -21,7 +21,7 @@ def test_metrics_instances_are_isolated_and_have_no_dynamic_labels() -> None:
     first_text = first.render_text()
     second_text = second.render_text()
     assert "inference_gateway_requests_total 2.0" in first_text
-    assert "inference_gateway_request_failures_total 2.0" in first_text
+    assert "inference_gateway_request_failures_total 1.0" in first_text
     assert "inference_gateway_queue_rejections_total 1.0" in first_text
     assert "inference_gateway_queue_depth 7.0" in first_text
     assert "inference_gateway_request_latency_seconds_count 1.0" in first_text

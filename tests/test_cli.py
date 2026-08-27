@@ -70,6 +70,7 @@ def test_parity_command_writes_configured_artifact(monkeypatch: Any) -> None:
     assert observed["args"][0] is model
     assert observed["args"][2] == Path("artifacts/parity.json")
     assert observed["kwargs"]["device"] == "auto"
+    assert observed["kwargs"]["model_name"] == "resnet18"
     assert '"top1_agreement": 1.0' in result.stdout
 
 
