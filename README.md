@@ -279,6 +279,39 @@ Measured environment:
 See [`artifacts/report.md`](artifacts/report.md) for the full generated table and methodology.
 <!-- BENCHMARK_RESULTS_END -->
 
+## Repeated concurrency diagnostics
+
+The original published matrix is a single CPU run. Its high-concurrency throughput
+drop is an observation, not a diagnosed root cause. A separate command now runs a
+longer, randomized concurrency sweep against an explicitly running server:
+
+```bash
+uv run inference-gateway diagnose --url http://127.0.0.1:8000 \
+  --concurrency 1,8,32,64 --repetitions 5 --requests 2000 \
+  --warmup-requests 100 --seed 2027 --output artifacts/diagnostics-onnx-direct
+```
+
+Start the desired backend/scheduler configuration with `serve` first. Run the client
+on a separate host when investigating client/server contention. The output directory
+must be new. The command saves its plan, every completed trial's raw samples and
+before/after server statistics, and a summary of whole-trial means, standard deviations,
+and ranges. Trial order is shuffled within each repetition from the recorded seed.
+Backend, device, and scheduler identity must remain consistent throughout the sweep.
+
+Successful HTTP responses now expose `upload_and_parse_ms` (arrival through file read),
+`preprocessing_ms` (executor waiting plus image transformation), and `server_processing_ms`
+(arrival through prediction construction). The load generator preserves these alongside
+queue and backend timings. This makes it possible to see whether delay accumulates before
+or after scheduler admission. Client time minus server time is a residual that includes
+transport, response processing, and timing boundary differences; it is not pure network
+latency. Missing or invalid timing telemetry remains unknown instead of becoming zero.
+
+These diagnostics use closed-loop concurrent workers, not a fixed arrival-rate workload.
+Tail percentiles cover successful requests; failures remain separately recorded in each
+trial. Standard deviations describe trial variation, not confidence intervals. This feature
+does not overwrite the canonical 32-case benchmark, and no new measured speedup or root
+cause is claimed without a fresh run.
+
 ## Docker
 
 The CPU image installs the frozen production dependency group, runs as an unprivileged `gateway`

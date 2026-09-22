@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import math
 import statistics
 import time
 from collections.abc import Mapping, Sequence
@@ -40,6 +41,9 @@ class RequestSample:
     queue_wait_ms: float | None
     backend_inference_ms: float | None
     realized_batch_size: int | None
+    server_processing_ms: float | None = None
+    upload_and_parse_ms: float | None = None
+    preprocessing_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation without rounding timings."""
@@ -145,6 +149,8 @@ def write_deterministic_image(path: str | Path, *, index: int = 0) -> Path:
 def _optional_float(payload: Mapping[str, Any], key: str) -> float | None:
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
         return None
     return float(value)
 
@@ -346,6 +352,9 @@ class AsyncLoadGenerator:
                 queue_wait_ms=_optional_float(payload, "queue_wait_ms"),
                 backend_inference_ms=_optional_float(payload, "backend_inference_ms"),
                 realized_batch_size=_optional_int(payload, "realized_batch_size"),
+                server_processing_ms=_optional_float(payload, "server_processing_ms"),
+                upload_and_parse_ms=_optional_float(payload, "upload_and_parse_ms"),
+                preprocessing_ms=_optional_float(payload, "preprocessing_ms"),
             )
         except httpx.TimeoutException as exc:
             return RequestSample(

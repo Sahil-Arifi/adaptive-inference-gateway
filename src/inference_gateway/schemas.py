@@ -36,6 +36,8 @@ class PredictResponse(ApiModel):
     device: str
     scheduler_mode: str
     server_processing_ms: float = Field(ge=0.0)
+    upload_and_parse_ms: float = Field(ge=0.0)
+    preprocessing_ms: float = Field(ge=0.0)
     queue_wait_ms: float = Field(ge=0.0)
     backend_inference_ms: float = Field(ge=0.0)
     realized_batch_size: int = Field(ge=1)
