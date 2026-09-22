@@ -100,6 +100,9 @@ async def test_concurrency_is_bounded_warmups_are_excluded_and_telemetry_is_pars
                 "queue_wait_ms": 1.25,
                 "backend_inference_ms": 2,
                 "realized_batch_size": 3,
+                "server_processing_ms": 8.5,
+                "upload_and_parse_ms": 1.0,
+                "preprocessing_ms": 2.0,
             },
         )
 
@@ -122,6 +125,9 @@ async def test_concurrency_is_bounded_warmups_are_excluded_and_telemetry_is_pars
     assert {sample.queue_wait_ms for sample in result.samples} == {1.25}
     assert {sample.backend_inference_ms for sample in result.samples} == {2.0}
     assert {sample.realized_batch_size for sample in result.samples} == {3}
+    assert {sample.server_processing_ms for sample in result.samples} == {8.5}
+    assert {sample.upload_and_parse_ms for sample in result.samples} == {1.0}
+    assert {sample.preprocessing_ms for sample in result.samples} == {2.0}
 
 
 @pytest.mark.asyncio

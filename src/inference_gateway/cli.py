@@ -224,6 +224,30 @@ def report_command(
     )
 
 
+@app.command("diagnose")
+def diagnose_command(
+    output: Annotated[Path, typer.Option("--output", help="New diagnostics directory.")],
+    url: Annotated[str, typer.Option("--url")] = "http://127.0.0.1:8000",
+    concurrency: Annotated[str, typer.Option("--concurrency")] = "1,8,32,64",
+    repetitions: Annotated[int, typer.Option("--repetitions", min=2)] = 5,
+    requests: Annotated[int, typer.Option("--requests", min=1)] = 2000,
+    warmup_requests: Annotated[int, typer.Option("--warmup-requests", min=0)] = 100,
+    seed: Annotated[int, typer.Option("--seed")] = 2027,
+) -> None:
+    """Repeat a randomized concurrency sweep against a running server; save raw trials."""
+    from inference_gateway.diagnostics import DiagnosticPlan, run_diagnostics
+
+    try:
+        plan = DiagnosticPlan(
+            concurrency=tuple(int(value.strip()) for value in concurrency.split(",")),
+            repetitions=repetitions, requests=requests, warmup_requests=warmup_requests, seed=seed,
+        )
+        result = asyncio.run(run_diagnostics(url, output, plan))
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Completed {result['completed_trials']} trials; raw evidence: {output}")
+
+
 def main() -> None:
     """Console-script adapter kept separate for direct module execution."""
 

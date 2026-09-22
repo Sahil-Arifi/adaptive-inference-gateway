@@ -438,6 +438,8 @@ def create_app(
                     detail=f"image exceeds the {limit}-byte upload limit",
                 )
             _raise_if_deadline_expired(deadline)
+            preprocessing_started = time.monotonic()
+            upload_and_parse_ms = (preprocessing_started - started) * 1000.0
             preprocess_future = _preprocessor(request).submit(payload)
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
@@ -450,6 +452,7 @@ def create_app(
                 if not preprocess_timeout.expired():
                     raise
                 raise RequestDeadlineExpiredError from exc
+            preprocessing_ms = (time.monotonic() - preprocessing_started) * 1000.0
             result = await runtime.predict(
                 tensor,
                 request_id=request_id,
@@ -526,6 +529,8 @@ def create_app(
             device=runtime.backend.device,
             scheduler_mode=runtime.stats.scheduler_mode,
             server_processing_ms=(time.monotonic() - started) * 1000.0,
+            upload_and_parse_ms=upload_and_parse_ms,
+            preprocessing_ms=preprocessing_ms,
             queue_wait_ms=result.queue_wait_ms,
             backend_inference_ms=result.backend_inference_ms,
             realized_batch_size=result.realized_batch_size,

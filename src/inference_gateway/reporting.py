@@ -450,7 +450,14 @@ def _validate_samples(
     samples: list[dict[str, Any]] = []
     for index, raw in enumerate(value):
         sample = _object(raw, f"{context}.samples[{index}]")
-        _exact_fields(sample, _SAMPLE_FIELDS, f"{context}.samples[{index}]")
+        # Additive diagnostics keep historical schema-1 artifacts readable.
+        optional_timings = {"server_processing_ms", "upload_and_parse_ms", "preprocessing_ms"}
+        _exact_fields(
+            sample, _SAMPLE_FIELDS | (sample.keys() & optional_timings),
+            f"{context}.samples[{index}]",
+        )
+        for key in sample.keys() & optional_timings:
+            _optional_finite(sample[key], f"{context}.samples[{index}].{key}")
         if _strict_int(sample["sequence"], f"{context}.samples[{index}].sequence") != index:
             raise ValueError(f"{context}.samples sequences must be contiguous and ordered")
         image_index = _strict_int(
